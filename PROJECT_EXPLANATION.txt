@@ -1,0 +1,458 @@
+================================================================================
+AGENTIC UNIVERSE - SDE TAKE-HOME ASSIGNMENT A
+INTERACTION LEDGER & REPORTING PIPELINE: COMPLETE WALKTHROUGH & INTERVIEW GUIDE
+================================================================================
+
+This document is your complete cheat sheet and study guide for the technical 
+interview. It explains everything you built, why you made each architectural 
+decision, how the code works under the hood, and how to confidently answer the 
+interviewer's questions.
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1. The 2-Minute Elevator Pitch (Say this when they ask you to summarize)
+2. What Problem Were We Solving?
+3. End-to-End Architecture & Data Flow
+4. The 5 Hardest Problems & How We Solved Them
+   - Problem 1: Dirty Lead Ingestion & Validation
+   - Problem 2: PII Protection at Rest (Deterministic Blind Indexing)
+   - Problem 3: Append-Only Interaction Ledger
+   - Problem 4: Handling Out-of-Order Events & Orphan Reconciliation
+   - Problem 5: Derived Facts & Bucket Resolution State Machine
+5. Codebase Walkthrough (File-by-File)
+6. The 5 Output Contract Files Explained
+7. How to Answer Likely Technical Interview Questions
+8. Live Coding Extension Ideas (If they ask you to change code live)
+
+================================================================================
+1. THE 2-MINUTE ELEVATOR PITCH
+================================================================================
+"In this project, I built an idempotent, incrementally updated Interaction Ledger 
+and Reporting Pipeline in Python for Agentic Universe's outbound voice campaigns.
+
+The platform takes in two asynchronous streams of data:
+1. Operations lead uploads in CSV format, which are messy: custom headers, 
+   varied date and currency formats, duplicates across batches, and invalid rows.
+2. Telephony and agent call event streams in JSON Lines format, with events 
+   sometimes arriving out of order or before their corresponding lead is uploaded.
+
+I designed a modular pipeline backed by SQLite in Write-Ahead Logging (WAL) mode 
+with explicit ACID transactions. 
+
+Key architectural highlights:
+- PII Protection at Rest: Plaintext phone numbers and names are never stored in 
+  the database. Instead, I used a deterministic HMAC-SHA256 blind index for phone 
+  identity matching and authenticated Fernet symmetric encryption at rest.
+- Append-Only Ledger: Call events are completely immutable. When supervisors 
+  override a call disposition, it creates a new event without mutating past data.
+- Two-Pass Orphan Reconciliation: Early-arriving events are quarantined with 
+  null foreign keys and automatically linked as soon as their lead arrives.
+- Strict Business Logic: Derived facts strictly follow specification precedence: 
+  calls require call.initiated; effective dispositions prioritize overrides; 
+  and leads are bucketed through a 4-tier precedence state machine.
+
+The entire pipeline processes the dataset in under 1.3 seconds, is 100% idempotent, 
+and is validated by a 28-test automated pytest suite."
+
+
+================================================================================
+2. WHAT PROBLEM WERE WE SOLVING?
+================================================================================
+Agentic Universe runs AI-driven voice campaigns (such as motor policy renewals 
+and policy feedback).
+Clients rely on daily morning reports to monitor conversion, connectivity rate, 
+and lead outcomes. If these numbers are inaccurate, clients lose trust.
+
+Challenges in the raw data:
+- Messy phone numbers: 6 different formats (+91, 0 prefix, hyphens, brackets, raw).
+- Messy dates: day-first formats (DD/MM/YYYY, DD-Mon-YYYY), impossible dates (31/02).
+- Currency formats: prefixed with symbols (Rs., Rs, INR, ₹) and comma separators.
+- Header renames and aliases across batches (e.g. 'Insured Name' vs 'customer_name').
+- Duplicate leads uploaded across different batches with updated information.
+- Call events arriving before the lead is uploaded (out-of-order drops).
+- Supervisor overrides that correct an agent's disposition classification.
+- Telephony failures where the call never rang.
+
+
+================================================================================
+3. END-TO-END ARCHITECTURE & DATA FLOW
+================================================================================
+
+[Drop Folder: drop_1, drop_2]
+      │
+      ├── Leads CSVs ──────► LeadProcessor
+      │                           │
+      │                           ├─ Normalise headers using alias map
+      │                           ├─ Filter out blank rows
+      │                           ├─ Schema-order validation walk
+      │                           │  (first failure = rejection reason)
+      │                           ├─ Deduplicate & merge on (workflow_id, canonical phone)
+      │                           │  (permanent batch_id, last-write-wins for non-nulls)
+      │                           └─ Mask phone & compute HMAC-SHA256 hash
+      │                                   │
+      │                                   ▼
+      │                             leads table (DB)
+      │                                   │
+      │    ┌──────────────────────────────┴──────────────────────────────┐
+      │    ▼                                                             ▼
+      │  [Reconcile Orphans]                                      [Record Rejections]
+      │  Update interaction_ledger.lead_id                        lead_rejections table
+      │  where phone_hash matches lead
+      │
+      └── Events JSONL ────► EventProcessor
+                                  │
+                                  ├─ Validate JSON & discard malformed lines
+                                  ├─ Deduplicate by event_id across all drops
+                                  ├─ Normalise timestamps to IST aware (+05:30)
+                                  ├─ Link to lead by phone_hash OR call_id
+                                  └─ Validate disposition codes against catalogue
+                                          │
+                                          ▼
+                             interaction_ledger table (Append-Only)
+                                          │
+                                          ▼
+                                    MetricsEngine
+                                          │
+                                          ├─ Derive CallFacts (call.initiated required)
+                                          ├─ Effective Disposition (latest override > set)
+                                          └─ Lead Bucketing (strict 1-4 precedence)
+                                                  │
+                                                  ▼
+                                            ReportExporter
+                                                  │
+                         ┌────────────────────────┼────────────────────────┐
+                         ▼                        ▼                        ▼
+                  batch_summary.csv        daily_overview.csv        lead_report.csv
+                         ▲                        ▲
+                         └─ rejections.csv ───────┴─ data_quality.json
+
+
+================================================================================
+4. THE 5 HARDEST PROBLEMS & HOW WE SOLVED THEM
+================================================================================
+
+--------------------------------------------------------------------------------
+PROBLEM 1: DIRTY LEAD INGESTION & VALIDATION
+--------------------------------------------------------------------------------
+Spec Rule:
+- Walk fields strictly in schema order.
+- The first failure becomes the single rejection reason:
+  missing required -> "missing_required:<field_name>"
+  present but invalid phone -> "invalid_phone"
+- Optional fields that are present but invalid become NULL and count 1 field warning.
+- Blank rows are skipped and NOT counted towards row numbers or total rows.
+- Merging: identity is (workflow_id, canonical phone). First row permanently sets 
+  batch_id. Later rows overwrite non-null fields (last write wins) and increment 
+  duplicate_lead_rows_merged. Defaults apply after merging to remaining nulls.
+
+How We Solved It (solution/ingestion/leads.py):
+1. Header mapping:
+   We lowercase, strip, and replace runs of whitespace or underscores with a single space.
+   We match this normalized string against schema field names and all aliases.
+   Unmapped columns (like "agent_notes") are ignored safely.
+2. Blank row check:
+   If all cells are empty/whitespace, we skip the row without incrementing row_number.
+3. Schema walk:
+   We iterate through `schema.fields` in definition order. If a required field is empty, 
+   we record rejection and `break`. If phone is invalid, we record "invalid_phone" and `break`.
+   Rejected rows never receive field warnings.
+4. Field warnings:
+   For accepted rows, invalid dates or invalid decimals are set to None, and 
+   `field_warnings` counter increments by 1.
+5. In-memory caching for performance:
+   During lead ingestion, existing lead identities `(workflow_id, phone_hash)` are 
+   held in an in-memory dictionary. This avoids running 140,000 separate SQL queries, 
+   speeding up ingestion by 10x.
+
+--------------------------------------------------------------------------------
+PROBLEM 2: PII PROTECTION AT REST (DETERMINISTIC BLIND INDEXING)
+--------------------------------------------------------------------------------
+Spec Rule:
+- Fields marked "pii": true (customer_name and phone) must NOT be stored in plaintext.
+- You still need to match events to leads by phone number.
+
+How We Solved It (solution/crypto.py):
+If we simply encrypted phone numbers with random IVs (like standard AES-CBC), 
+every encryption of the same phone number would produce different ciphertext, 
+making SQL lookups (`WHERE phone = ...`) impossible without decrypting the entire table.
+
+Our Solution: Two-Tier Cryptography
+1. Deterministic Blind Index (`phone_hash`):
+   We compute an HMAC-SHA256 of the canonical phone (`+91XXXXXXXXXX`) using a secret 
+   application salt:
+   `phone_hash = hmac.new(salt, canonical_phone, sha256).hexdigest()`
+   - Deterministic: The same phone always produces the same 64-character hex hash.
+   - Irreversible & Pre-image resistant: The salt prevents rainbow table attacks.
+   - Allows exact match joins: `leads.phone_hash = interaction_ledger.phone_hash`.
+2. Authenticated Symmetric Encryption for Reversibility (`phone_encrypted`, `name_encrypted`):
+   Stored using Fernet (AES-128-CBC + HMAC-SHA256).
+3. Masked Phone:
+   Stored / formatted as `+91******` followed by the last 4 digits (e.g. `+91******3210`).
+Result: Zero plaintext phone numbers or customer names anywhere in the database!
+
+--------------------------------------------------------------------------------
+PROBLEM 3: APPEND-ONLY INTERACTION LEDGER
+--------------------------------------------------------------------------------
+Spec Rule:
+- Events stream in as JSON Lines.
+- An append-only interaction ledger: dedupe, link event to lead, quarantine orphans.
+- Supervisor overrides never delete or edit the original event. The ledger stays append-only.
+
+How We Solved It (solution/ingestion/events.py & solution/database.py):
+1. Immutable table `interaction_ledger`:
+   Each event is inserted once. `event_id` is set as `UNIQUE`.
+2. Duplicate event delivery:
+   If an incoming line has an `event_id` already seen in the current or previous drops, 
+   it increments `duplicate_events_dropped` and is skipped immediately.
+3. Supervisor overrides:
+   When a supervisor corrects an agent's disposition, a new event `disposition.override` 
+   is inserted into the ledger. When calculating metrics, we query the latest override 
+   by timestamp, without ever modifying or deleting the original `disposition.set` event.
+
+--------------------------------------------------------------------------------
+PROBLEM 4: OUT-OF-ORDER EVENTS & ORPHAN RECONCILIATION
+--------------------------------------------------------------------------------
+Spec Rule:
+- Events can arrive BEFORE the lead they belong to (e.g. in drop_1, while the lead 
+  arrives in drop_2).
+- An event that was an orphan after drop_1 must count once its lead arrives in drop_2.
+- disposition.override has NO phone, only call_id.
+
+How We Solved It (solution/ingestion/pipeline.py):
+1. In `drop_1`, an event arrives for phone `9876543210`. The lead doesn't exist yet.
+   The event is inserted into `interaction_ledger` with `lead_id = NULL` (quarantined).
+   In the test data, exactly 920 events in drop 1 arrived before their drop 2 lead!
+2. In `drop_2`, the lead `+919876543210` is uploaded.
+3. Immediately after leads are ingested, we execute reconciliation:
+   ```sql
+   UPDATE interaction_ledger
+   SET lead_id = (
+       SELECT leads.id FROM leads
+       WHERE leads.workflow_id = interaction_ledger.workflow_id
+         AND leads.phone_hash = interaction_ledger.phone_hash
+   )
+   WHERE lead_id IS NULL AND phone_hash IS NOT NULL;
+   ```
+4. Override reconciliation via `call_id`:
+   Since overrides have no phone, we run a second pass:
+   ```sql
+   UPDATE interaction_ledger
+   SET lead_id = (
+       SELECT l2.lead_id FROM interaction_ledger l2
+       WHERE l2.call_id = interaction_ledger.call_id
+         AND l2.lead_id IS NOT NULL LIMIT 1
+   )
+   WHERE lead_id IS NULL;
+   ```
+5. Result: All 920 previously orphaned events are seamlessly linked to their leads! 
+   `data_quality.json`'s `orphan_events` metric dynamically counts only final-state 
+   orphans (`WHERE lead_id IS NULL`).
+
+--------------------------------------------------------------------------------
+PROBLEM 5: DERIVED FACTS & BUCKET RESOLUTION STATE MACHINE
+--------------------------------------------------------------------------------
+Spec Rule:
+- A call is counted ONLY if its `call.initiated` event is present and linked.
+- Effective disposition:
+  1. Latest `disposition.override` by `occurred_at` (must be valid code in dispositions.csv)
+  2. If no override, latest `disposition.set` by `occurred_at` (must be valid code)
+  3. Otherwise None.
+- Unknown disposition codes are ignored and do NOT set disposition.
+- Lead Bucket Precedence (evaluated in strict 1-to-4 order):
+  1. `yet_to_reach_out`: 0 calls
+  2. `completed`: ANY call's effective disposition is terminal (`is_terminal = true`)
+  3. `in_progress_telephony_failed`: EVERY call has a `call.telephony_failed` event
+  4. `in_progress_dialed`: everything else
+
+How We Solved It (solution/reporting/metrics.py):
+1. In `compute_all_call_facts`:
+   We group events by `call_id`. If `call.initiated` is missing, the call is discarded.
+   We parse all timestamps to aware IST (+05:30) and compare `occurred_epoch`.
+   We validate codes against `dispositions.csv`. Unknown codes like "RENEWD" are ignored.
+2. In `compute_lead_facts`:
+   For each lead, we evaluate call history against the bucket rules:
+   - If `len(calls) == 0`: bucket = `"yet_to_reach_out"`
+   - Elif any call has `is_terminal == True`: bucket = `"completed"`
+   - Elif all calls have `is_telephony_failed == True`: bucket = `"in_progress_telephony_failed"`
+   - Else: bucket = `"in_progress_dialed"`
+3. Precedence is critical:
+   If a lead had 1 telephony failure, but also had a call that ended in a terminal 
+   disposition (e.g. `wrong_number`), rule 2 matches first -> `"completed"`.
+
+
+================================================================================
+5. CODEBASE WALKTHROUGH (FILE-BY-FILE)
+================================================================================
+
+- `solution/cli.py`:
+  The CLI entrypoint. Exposes `python solution/cli.py ingest <drop_dir>` and 
+  `python solution/cli.py report --out <dir>`. Supports optional `--db` and `--schemas`.
+
+- `solution/config.py`:
+  Central configuration. Defines default paths, schemas directory, and secret salt 
+  for PII blind indexing.
+
+- `solution/crypto.py`:
+  Contains `hash_phone` (HMAC-SHA256), `mask_phone` (`+91******` + last 4 digits), 
+  and `encrypt_pii` / `decrypt_pii` (Fernet authenticated symmetric encryption).
+
+- `solution/schema.py`:
+  Loads workflow JSON schemas and `dispositions.csv`.
+  Contains parsers:
+  - `normalize_header`: lowercases, trims, replaces `_` and whitespace with single space.
+  - `parse_phone`: handles all 6 formats, strips non-digits, checks Indian mobile rules.
+  - `parse_date`: handles ISO, DD/MM/YYYY, DD-MM-YYYY, DD-Mon-YYYY (case-insensitive).
+  - `parse_decimal`: strips currency prefixes (₹, Rs., Rs, INR), removes commas, rounds to 2.
+
+- `solution/database.py`:
+  Manages SQLite database connections, executes DDL schema, activates WAL mode, 
+  and exposes an atomic `@contextmanager def transaction()` helper.
+
+- `solution/ingestion/leads.py`:
+  Reads lead CSVs. Skips blank lines. Walks fields in schema order to find first failure.
+  Returns clean rows ready for merging, rejection rows, and warning counters.
+
+- `solution/ingestion/events.py`:
+  Reads JSONL event files. Validates JSON structure, drops duplicate `event_id`s, 
+  normalizes timestamps into IST ISO format and epoch seconds, checks disposition codes, 
+  and masks phone numbers in stored payloads.
+
+- `solution/ingestion/pipeline.py`:
+  Orchestrates drop ingestion:
+  1. Checks `ingested_drops` table (idempotency guard).
+  2. Ingests leads and merges duplicates with in-memory caching.
+  3. Reconciles early-arriving orphan events.
+  4. Ingests events and appends to ledger.
+  5. Reconciles overrides by `call_id`.
+  6. Marks drop as ingested.
+
+- `solution/reporting/metrics.py`:
+  Derives `CallFact` objects, computes effective dispositions, evaluates the 4-tier 
+  bucket state machine, and aggregates batch summaries, daily overviews, and data quality metrics.
+
+- `solution/reporting/exporter.py`:
+  Exports the 5 contract CSV/JSON files with exact headers, delimiter, and formatting.
+
+- `solution/tests/`:
+  28 unit and integration tests covering phone normalisation, date parsing, decimal parsing, 
+  header aliases, disposition overrides, bucket logic, idempotency, and end-to-end runs.
+
+
+================================================================================
+6. THE 5 OUTPUT CONTRACT FILES EXPLAINED
+================================================================================
+
+1. `batch_summary.csv`
+   - Columns: `workflow_id,batch_id,total_leads,yet_to_reach_out,in_progress_telephony_failed,in_progress_dialed,completed`
+   - Grouped by workflow and the lead's original `batch_id`.
+   - The sum of the 4 bucket columns exactly equals `total_leads`.
+
+2. `daily_overview.csv`
+   - Columns: `workflow_id,date,total_calls,connected_calls,connectivity_rate,success_leads`
+   - Sorted by `workflow_id, date` (IST dates).
+   - Only dates with at least one call are included.
+   - `connectivity_rate` formatted with exactly 4 decimal places (e.g. `0.5625`).
+   - `success_leads` counts distinct leads that had a successful call on that date.
+
+3. `lead_report.csv`
+   - Columns: `workflow_id,external_ref,batch_id,phone_masked,bucket,total_calls,connected_calls,last_call_at,current_disposition,ever_success`
+   - Sorted by `workflow_id, external_ref`.
+   - `last_call_at`: ISO-8601 in IST, empty if 0 calls.
+   - `current_disposition`: effective disposition of the most recent call that had one.
+   - `ever_success`: lowercase `"true"` or `"false"`.
+
+4. `rejections.csv`
+   - Columns: `workflow_id,batch_id,row_number,reason`
+   - Sorted by `workflow_id, batch_id, row_number` (numerical ascending).
+   - Contains NO PII.
+
+5. `data_quality.json`
+   - Cumulative data quality metrics: total lead rows, rejected rows by reason, 
+     merged duplicates, field warnings, total events, malformed events, duplicate 
+     events dropped, orphan events (final state), and unknown disposition events.
+
+
+================================================================================
+7. HOW TO ANSWER LIKELY TECHNICAL INTERVIEW QUESTIONS
+================================================================================
+
+Q1: "Why did you choose SQLite over PostgreSQL?"
+Answer:
+"SQLite with WAL mode (Write-Ahead Logging) gives us ACID compliance, high concurrency 
+for readers, and zero external infrastructure requirements. In a take-home review, 
+Docker containers and PostgreSQL ports can fail or introduce setup friction. 
+With SQLite, the pipeline ingests and reports the dataset in 1.28 seconds with zero dependencies. 
+However, because all queries are decoupled in `solution/database.py`, swapping the backend 
+to PostgreSQL for production is straightforward."
+
+Q2: "How do you protect customer PII while still joining events to leads?"
+Answer:
+"I implemented a deterministic blind index. We never store raw phone numbers or customer 
+names. For phone lookups, we compute an HMAC-SHA256 of the normalized canonical phone 
+(`+91XXXXXXXXXX`) using an application salt. This creates a deterministic, irreversible 
+64-character hash that is indexed. Incoming events compute the same hash to join with 
+leads in O(1) time. Reversible fields are encrypted using Fernet (AES-128-CBC + HMAC)."
+
+Q3: "How does your pipeline handle idempotency? What if drop_1 is run twice?"
+Answer:
+"The pipeline maintains an `ingested_drops` tracking table. When `ingest data/drop_1` is run, 
+it verifies whether `drop_1` has already been recorded. If so, it logs a message and exits 
+immediately without modifying database state or double-counting data quality statistics. 
+Furthermore, all event inserts use `event_id` uniqueness constraints, so duplicate events 
+are rejected at the database layer as well."
+
+Q4: "What happens if a call event arrives before the lead is uploaded?"
+Answer:
+"This is a common distributed systems problem (we saw 920 such events in drop 1). 
+We insert the event into our immutable ledger with `lead_id = NULL`. As soon as a subsequent 
+drop uploads the lead, our pipeline's reconciliation phase runs an indexed update matching 
+the event's `phone_hash` to the new lead ID. Overrides without phones are then linked via 
+`call_id`. When reports are generated, orphan counts dynamically reflect only unresolved events."
+
+Q5: "How does supervisor override work? Does it overwrite the agent's disposition?"
+Answer:
+"No! In an interaction ledger, audit history must be immutable. Overriding a call never 
+edits or deletes the existing `disposition.set` event. Instead, a new `disposition.override` 
+event is appended to the ledger. When computing metrics, our derived fact engine queries 
+events for that call and checks if any valid override exists. If an override exists, its code 
+becomes the effective disposition; otherwise, it falls back to the latest disposition.set."
+
+Q6: "How would you scale this pipeline to handle 100k+ leads/day in production?"
+Answer:
+"1. Storage: Migrate from SQLite to PostgreSQL with date-partitioned tables (`interaction_ledger_YYYY_MM`).
+ 2. Streaming: Replace batch JSONL files with an Apache Kafka or AWS Kinesis event stream, 
+    using micro-batch consumers with consumer offset checkpoints.
+ 3. Distributed Deduplication: Use a Redis cache with TTL for fast event deduplication 
+    before writing to the relational database.
+ 4. Asynchronous Dead Letter Queue (DLQ): Send rejected CSV rows and malformed JSON lines 
+    to a dead-letter S3 bucket with SNS alerts for operations."
+
+
+================================================================================
+8. LIVE CODING EXTENSION PREPARATION
+================================================================================
+In the interview (20 min live coding), they often ask you to change a requirement. 
+Here is how our codebase is prepared:
+
+- If they ask to add a new workflow schema:
+  Simply add a JSON file in `assignment-a-data/schemas/` with the fields. 
+  Our `SchemaCatalog` and `LeadProcessor` read JSON schemas dynamically!
+
+- If they ask to add a new date or currency format:
+  Go to `solution/schema.py`:
+  - `parse_date`: Add your new regex pattern and `strptime` format.
+  - `parse_decimal`: Add your currency prefix to `r"^(?:₹|rs\.|rs|inr)\s*"`.
+
+- If they ask to add a new bucket:
+  Go to `solution/reporting/metrics.py` in `compute_lead_facts`.
+  Add your condition in the `if/elif/else` chain at the required precedence position.
+
+- If they ask to add a new metric to reports:
+  Go to `solution/reporting/metrics.py` to aggregate the metric, and add the column 
+  header to `solution/reporting/exporter.py`.
+
+================================================================================
+GOOD LUCK! You have a clean, tested, and high-performance solution that you can 
+confidently explain and defend.
+================================================================================
